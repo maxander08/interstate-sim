@@ -83,6 +83,7 @@ let wx, wy, sx, sy;
 let WXMIN = 0, WXMAX = 0, WYMIN = 0, WYMAX = 0;
 let STATES_W = [], routeAnchor = [], GRAT = [], CITIES_W = [];
 let geoGrid = null, edgeLive = null;
+let labelW = null, labelNum = null;   // cached route-shield text widths (per theater)
 let HYDRO_W = { L: [], R: [] }, COUNTY_W = [], ART_W = [];
 
 function albers(lon, lat) {
@@ -158,7 +159,7 @@ function buildTheater(key) {
         const p = albers(ring[i][0], ring[i][1]);
         a[i * 2] = p[0]; a[i * 2 + 1] = p[1];
       }
-      return a;
+      return [a, bboxOf(a)];
     })
   }));
   routeAnchor = ROUTES.map(r => {
@@ -169,20 +170,28 @@ function buildTheater(key) {
   const toWF = pts => Float32Array.from(pts.flatMap(p => albers(p[0] / 1e3, p[1] / 1e3)));
   HYDRO_W = { L: [], R: [] };
   if (T.hydro) {
-    for (const ring of T.hydro.L) HYDRO_W.L.push(toWF(ring));
-    for (const ln of T.hydro.R) HYDRO_W.R.push(toWF(ln));
+    for (const ring of T.hydro.L) { const a = toWF(ring); HYDRO_W.L.push([a, bboxOf(a)]); }
+    for (const ln of T.hydro.R) { const a = toWF(ln); HYDRO_W.R.push([a, bboxOf(a)]); }
   }
   COUNTY_W = [];
-  if (T.counties) for (const ring of T.counties) COUNTY_W.push(toWF(ring));
+  if (T.counties) for (const ring of T.counties) { const a = toWF(ring); COUNTY_W.push([a, bboxOf(a)]); }
   ART_W = [];
-  if (T.art) for (const a of T.art) ART_W.push([a.c, toWF(a.pts)]);
+  if (T.art) for (const a of T.art) { const f = toWF(a.pts); ART_W.push([a.c, f, bboxOf(f)]); }
   GRAT = [];
   const [lo0, lo1, loS] = T.grat.lons, [la0, la1, laS] = T.grat.lats;
   for (let lo = lo0; lo <= lo1; lo += loS)
     GRAT.push([albers(lo, la0 - 1), albers(lo, la1 + 1), Math.abs(lo) + '°' + (lo < 0 ? 'W' : 'E'), true]);
   for (let la = la0; la <= la1; la += laS)
     GRAT.push([albers(lo0 - 1, la), albers(lo1 + 1, la), Math.abs(la) + '°' + (la < 0 ? 'S' : 'N'), false]);
-  CITIES_W = T.cities.map(c => { const p = albers(c[1], c[2]); return [c[0], p[0], p[1], c[3] || 1.5]; });
+  CITIES_W = T.cities.map(c => { const p = albers(c[1], c[2]); return [c[0].split(',')[0].toUpperCase(), p[0], p[1], c[3] || 1.5, -1]; });
+}
+function bboxOf(a) {
+  let x0 = 9e9, y0 = 9e9, x1 = -9e9, y1 = -9e9;
+  for (let i = 0; i < a.length; i += 2) {
+    if (a[i] < x0) x0 = a[i]; if (a[i] > x1) x1 = a[i];
+    if (a[i + 1] < y0) y0 = a[i + 1]; if (a[i + 1] > y1) y1 = a[i + 1];
+  }
+  return [x0, y0, x1, y1];
 }
 const hav = (lo1, la1, lo2, la2) => {
   const r1 = la1 * Math.PI / 180, r2 = la2 * Math.PI / 180;
@@ -199,6 +208,10 @@ const DPR = Math.min(window.devicePixelRatio || 1, 1.75);
 let VW = 0, VH = 0;
 const cam = { cx: 0, cy: 0, z: 1, zFit: 1 };
 const base = document.createElement('canvas'), bctx = base.getContext('2d');
+// while the camera moves we don't retrace the whole vector stack per frame —
+// frame() stretches the previous base (Google-Maps-style) and we retrace on settle
+let baseStale = false, camMovedAt = 0, lastRetrace = 0, rtrT = 0, wheelT = 0, gridDirty = false;
+const prevCam = { cx: 0, cy: 0, z: 1 };
 
 const L = { traffic: true, labels: true, cities: true, grid: false, states: true, fx: true, art: true, cty: true, hydro: true };
 
@@ -211,7 +224,7 @@ function resize() {
   vehCv.getContext('2d').setTransform(DPR, 0, 0, DPR, 0, 0);
   bctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   cam.zFit = Math.min(VW / (WXMAX - WXMIN), VH / (WYMAX - WYMIN)) * 0.86;
-  cameraChanged();
+  cameraChanged(); retraceBaseNow();
 }
 function worldToScreen(u, v) { return [(u - cam.cx) * cam.z + VW / 2, VH / 2 - (v - cam.cy) * cam.z]; }
 function cameraChanged() {
@@ -219,8 +232,26 @@ function cameraChanged() {
     sx[i] = (wx[i] - cam.cx) * cam.z + VW / 2;
     sy[i] = VH / 2 - (wy[i] - cam.cy) * cam.z;
   }
-  drawBase(); buildPickGrid(); clearVeh();
+  if (!baseStale) camMovedAt = performance.now();
+  baseStale = true;
+  clearTimeout(rtrT); rtrT = setTimeout(retraceBaseNow, 90);
+  gridDirty = true; clearVeh();
   if (selRoute >= 0) updateSelBbox();
+}
+/* stretch of the stale base under the current camera (pure bitblit, ~free) */
+function blitBase() {
+  if (!baseStale || !lastRetrace) { ctx.drawImage(base, 0, 0, VW, VH); return; }
+  const k = cam.z / prevCam.z;
+  const dx = VW / 2 * (1 - k) + (prevCam.cx - cam.cx) * cam.z;
+  const dy = VH / 2 * (1 - k) - (prevCam.cy - cam.cy) * cam.z;
+  ctx.fillStyle = '#010308'; ctx.fillRect(0, 0, VW, VH);
+  ctx.drawImage(base, dx, dy, VW * k, VH * k);
+}
+function retraceBaseNow() {
+  clearTimeout(rtrT);
+  baseStale = false; lastRetrace = performance.now();
+  prevCam.cx = cam.cx; prevCam.cy = cam.cy; prevCam.z = cam.z;
+  drawBase();
 }
 function updateSelBbox() {
   let X0 = 9e9, Y0 = 9e9, X1 = -9e9, Y1 = -9e9;
@@ -247,6 +278,27 @@ function drawBase() {
 
   bctx.lineJoin = 'round'; bctx.lineCap = 'round';
 
+  /* view-rect culling (skip polylines fully offscreen) + coarse-zoom decimation */
+  const zm = 80 / cam.z;
+  const vu0 = cam.cx - VW / 2 / cam.z - zm, vu1 = cam.cx + VW / 2 / cam.z + zm;
+  const vv0 = cam.cy - VH / 2 / cam.z - zm, vv1 = cam.cy + VH / 2 / cam.z + zm;
+  const inView = bb => bb[0] < vu1 && bb[2] > vu0 && bb[1] < vv1 && bb[3] > vv0;
+  const pStride = cam.z / cam.zFit < 1.15 ? 3 : cam.z / cam.zFit < 2.2 ? 2 : 1;
+  const traceArr = (arr, close, st = 1) => {
+    // never decimate sparse rings: skipping corners of an already DP-minimal
+    // polygon draws chords across its interior (rectangular states!)
+    if (arr.length / 2 < 40) st = 1;
+    for (let i = 0; i < arr.length; i += 2 * st) {
+      const p = worldToScreen(arr[i], arr[i + 1]);
+      i ? bctx.lineTo(p[0], p[1]) : bctx.moveTo(p[0], p[1]);
+    }
+    if (st > 1 && (arr.length - 2) % (2 * st)) {
+      const p = worldToScreen(arr[arr.length - 2], arr[arr.length - 1]);
+      bctx.lineTo(p[0], p[1]);
+    }
+    if (close) bctx.closePath();
+  };
+
   if (L.grid) {
     bctx.strokeStyle = 'rgba(24,224,255,0.07)'; bctx.lineWidth = 1;
     bctx.beginPath();
@@ -261,41 +313,31 @@ function drawBase() {
     bctx.strokeStyle = 'rgba(52,142,172,0.58)'; bctx.lineWidth = 1;
     bctx.fillStyle = 'rgba(8,26,38,0.5)';
     bctx.beginPath();
-    for (const st of STATES_W) for (const ring of st.r) {
-      for (let i = 0; i < ring.length / 2; i++) {
-        const p = worldToScreen(ring[i * 2], ring[i * 2 + 1]);
-        i ? bctx.lineTo(p[0], p[1]) : bctx.moveTo(p[0], p[1]);
-      }
-      bctx.closePath();
+    for (const st of STATES_W) for (const [ring, bb] of st.r) {
+      if (!inView(bb)) continue;
+      traceArr(ring, true);   // state/province outlines are the visual skeleton: full fidelity
     }
     bctx.fill(); bctx.stroke();
   }
 
   /* hydro backdrop: lakes fill + stroke, rivers thin */
-  const traceArr = (arr, close) => {
-    for (let i = 0; i < arr.length; i += 2) {
-      const p = worldToScreen(arr[i], arr[i + 1]);
-      i ? bctx.lineTo(p[0], p[1]) : bctx.moveTo(p[0], p[1]);
-    }
-    if (close) bctx.closePath();
-  };
-  if (L.hydro && HYDRO_W.L.length) {
+  if (L.hydro && (HYDRO_W.L.length || HYDRO_W.R.length)) {
     bctx.fillStyle = 'rgba(13,48,64,0.55)';
     bctx.strokeStyle = 'rgba(36,118,150,0.45)'; bctx.lineWidth = 0.8;
     bctx.beginPath();
-    for (const ring of HYDRO_W.L) traceArr(ring, true);
+    for (const [ring, bb] of HYDRO_W.L) { if (inView(bb)) traceArr(ring, true, pStride); }
     bctx.fill(); bctx.stroke();
     bctx.strokeStyle = 'rgba(32,112,142,0.30)'; bctx.lineWidth = 0.7;
     bctx.beginPath();
-    for (const ln of HYDRO_W.R) traceArr(ln, false);
+    for (const [ln, bb] of HYDRO_W.R) { if (inView(bb)) traceArr(ln, false, pStride); }
     bctx.stroke();
   }
 
-  /* county mesh (US) */
+  /* county mesh (US) / regency mesh (ID) */
   if (L.cty && COUNTY_W.length && cam.z / cam.zFit > (NETW.style === 'ID' ? 0.8 : 0.42)) {
     bctx.strokeStyle = 'rgba(48,126,154,0.18)'; bctx.lineWidth = 0.6;
     bctx.beginPath();
-    for (const ring of COUNTY_W) traceArr(ring, true);
+    for (const [ring, bb] of COUNTY_W) { if (inView(bb)) traceArr(ring, true, pStride); }
     bctx.stroke();
   }
 
@@ -307,7 +349,7 @@ function drawBase() {
       if (cls === 3 && zf2 < 1.7) continue;
       bctx.strokeStyle = styles[cls][0]; bctx.lineWidth = styles[cls][1];
       bctx.beginPath();
-      for (const [c, arr] of ART_W) { if (c === cls) traceArr(arr, false); }
+      for (const [c, arr, bb] of ART_W) { if (c === cls && inView(bb)) traceArr(arr, false, pStride); }
       bctx.stroke();
     }
   }
@@ -389,6 +431,7 @@ function buildPickGrid() {
 }
 function pickEdge(mx, my) {
   let best = -1, bestD = 9;
+  if (!pickGrid) return -1;
   const R = 2;
   const cgx = Math.floor(mx / CELL), cgy = Math.floor(my / CELL);
   for (let gx = cgx - R; gx <= cgx + R; gx++) for (let gy = cgy - R; gy <= cgy + R; gy++) {
@@ -502,16 +545,20 @@ function stepSim(dtReal) {
 /* ── 7 · render loop ────────────────────────────────────────── */
 const BEAR_COL = ['#49c8ff', '#38ffb2', '#ffb03a', '#c77dff'];
 const pings = [];
-let lastT = performance.now(), hudT = 0, tickerT = 0, pingT = 0;
+let lastT = performance.now(), hudT = 0, tickerT = 0, pingT = 0, frameN = 0;
 let avgSpeed = 0;
 let routeVehCount = new Int32Array(0), routeSpdSum = new Float32Array(0);
 
 function frame(now) {
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+  if (baseStale && now - lastRetrace > 130 &&
+      ((now - camMovedAt > 220 && !dragging && !tween && now - wheelT > 200) || now - camMovedAt > 2000))
+    retraceBaseNow();
+  if (gridDirty) { gridDirty = false; buildPickGrid(); }
   stepSim(dt);
 
   ctx.clearRect(0, 0, VW, VH);
-  ctx.drawImage(base, 0, 0, VW, VH);
+  blitBase();
 
   const hotR = hoverEdge >= 0 ? eR[hoverEdge] : -1;
   if (hotR >= 0 && hotR !== selRoute) drawRouteGlow(hotR, 'rgba(24,224,255,0.55)', 2.2);
@@ -522,9 +569,13 @@ function frame(now) {
   }
 
   if (L.traffic && vN > 0) {
-    vctx.globalCompositeOperation = 'destination-out';
-    vctx.fillStyle = 'rgba(0,0,0,0.30)';
-    vctx.fillRect(0, 0, VW, VH);
+    // trail fade is the single most expensive per-frame op — run it every other
+    // frame with compensated alpha (0.30/frame ≈ 0.51/2 frames): visually identical
+    if ((frameN = (frameN + 1) & 1) === 0) {
+      vctx.globalCompositeOperation = 'destination-out';
+      vctx.fillStyle = 'rgba(0,0,0,0.51)';
+      vctx.fillRect(0, 0, VW, VH);
+    }
     vctx.globalCompositeOperation = 'lighter';
     routeVehCount.fill(0); routeSpdSum.fill(0);
     let spd = 0;
@@ -610,9 +661,18 @@ function drawLabels() {
     if (!r.aux && zoomF < 0.5 && i % 2) continue;
     const p = worldToScreen(routeAnchor[i].x, routeAnchor[i].y);
     if (p[0] < -30 || p[0] > VW + 30 || p[1] < -30 || p[1] > VH + 30) continue;
-    const num = NETW.style === 'ID' ? r.n : (r.n.slice(2).length ? r.n.slice(2) : r.n);   // US strips "I-", ID codes shown whole
+    if (!labelW || labelW.length !== NR) {
+      labelW = new Float32Array(NR).fill(-1);
+      labelNum = ROUTES.map(rr => NETW.style === 'ID' ? rr.n : (rr.n.slice(2).length ? rr.n.slice(2) : rr.n));
+    }
+    const num = labelNum[i];
+    let wTxt = labelW[i];
+    if (wTxt < 0) {
+      ctx.font = '700 9.5px Orbitron, sans-serif';
+      wTxt = labelW[i] = ctx.measureText(num).width + 10;
+    }
     ctx.font = (r.aux ? '600 8.5px' : '700 9.5px') + ' Orbitron, sans-serif';
-    const wTxt = ctx.measureText(num).width + 10;
+    if (r.aux) wTxt *= 0.92;
     let clash = false;
     for (const q of placed)
       if (Math.abs(q[0] - p[0]) < (q[2] + wTxt) / 2 + 4 && Math.abs(q[1] - p[1]) < 18) { clash = true; break; }
@@ -643,15 +703,17 @@ function drawCities() {
   ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
   const placed = [];
   let shown = 0;
-  for (const [name, u, v, tier] of CITIES_W) {
+  for (const c of CITIES_W) {
+    const [name, u, v, tier] = c;
     const gate = cityGate(tier);
     if (zoomF < gate) continue;
     const p = worldToScreen(u, v);
     if (p[0] < -60 || p[0] > VW + 60 || p[1] < -40 || p[1] > VH + 40) continue;
     const deep = tier >= 5.5;
-    const nm = name.split(',')[0].toUpperCase();
+    const nm = name;
     ctx.font = (tier < 1.5 ? '700 10px' : tier < 2.5 ? '600 9px' : deep ? '600 8px' : '600 8.5px') + ' "Share Tech Mono", monospace';
-    const w = ctx.measureText(nm).width;
+    if (c[4] < 0) c[4] = ctx.measureText(nm).width;   // constant per city — measure once
+    const w = c[4];
     const bx = p[0] + 6, by = p[1] - 7, bw = w + 7, bh = 12;
     let clash = shown > 260;
     if (!clash)
@@ -833,7 +895,7 @@ async function refreshLive(first) {
       ? `${fmtInt(LIVE.n)} / ${fmtInt(LIVE.mapped)} SEGS`
       : 'NO COVERAGE IN THEATER';
     renderLiveSlow();
-    drawBase();
+    retraceBaseNow();
     if (LIVE._mlog !== LIVE.mapped) {
       LIVE._mlog = LIVE.mapped;
       teleLog(`LIVE SYNC ${d.src} — ${d.n} LINKS · ${LIVE.mapped} SEGS MAPPED`, LIVE.mapped ? 'ok' : 'warn');
@@ -1064,7 +1126,7 @@ function switchTheater(key, silent) {
     $('live-map').textContent = LIVE.mapped ? `${fmtInt(LIVE.n)} / ${fmtInt(LIVE.mapped)} SEGS` : 'NO COVERAGE IN THEATER';
   clearSelection(); clearVeh();
   buildRouteList(); updateTheaterChrome();
-  resize(); fitView();
+  resize(); fitView(); retraceBaseNow();
   document.querySelectorAll('#theater-seg button').forEach(b =>
     b.classList.toggle('active', b.dataset.theater === key));
   if (!silent) {
@@ -1105,7 +1167,7 @@ for (const b of document.querySelectorAll('#layer-seg button')) {
     L[b.dataset.layer] = b.classList.contains('active');
     for (const id of ['fx-scan', 'fx-vignette', 'fx-sweep'])
       $(id).style.display = L.fx ? '' : 'none';
-    cameraChanged();
+    cameraChanged(); retraceBaseNow();
   });
 }
 $('zoom-in').addEventListener('click', () => { cam.z = clamp(cam.z * 1.45, cam.zFit * 0.4, cam.zFit * 60); cameraChanged(); });
@@ -1154,6 +1216,7 @@ mapCv.addEventListener('click', () => {
 });
 mapCv.addEventListener('wheel', e => {
   e.preventDefault();
+  wheelT = performance.now();
   const f = e.deltaY < 0 ? 1.16 : 1 / 1.16;
   const nz = clamp(cam.z * f, cam.zFit * 0.4, cam.zFit * 60);
   const u = (e.clientX - VW / 2), v = (VH / 2 - e.clientY);
