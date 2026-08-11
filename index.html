@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>INTERSTATE GRID // Traffic Simulation Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ═══ MAP LAYERS ═══ -->
+<canvas id="map"></canvas>
+<canvas id="veh"></canvas>
+
+<!-- ═══ FX OVERLAYS ═══ -->
+<div id="fx-vignette"></div>
+<div id="fx-scan"></div>
+<div id="fx-sweep"></div>
+<div id="fx-flash"></div>
+
+<!-- ═══ HUD FRAME ═══ -->
+<div class="hud-corner tl"></div><div class="hud-corner tr"></div>
+<div class="hud-corner bl"></div><div class="hud-corner br"></div>
+
+<!-- ═══ BOOT SEQUENCE ═══ -->
+<div id="boot">
+  <div class="boot-inner">
+    <div class="boot-logo">US-DOT // EISENHOWER INTERSTATE SYSTEM</div>
+    <div class="boot-sub">NATIONAL TRAFFIC SIMULATION CONSOLE v4.7.1</div>
+    <div class="boot-bar"><div id="boot-fill"></div></div>
+    <div id="boot-log"></div>
+  </div>
+</div>
+
+<!-- ═══ TOP BAR ═══ -->
+<header id="topbar" class="panel hud-hidden">
+  <div class="tb-left">
+    <div class="tb-title">INTERSTATE<span>GRID</span></div>
+    <div class="tb-sub" id="tb-sub">CONUS NETWORK · LIVE SIM</div>
+    <div class="theater-seg" id="theater-seg">
+      <button data-theater="CONUS" class="active">◈ CONUS</button>
+      <button data-theater="NUSANTARA">◈ NUSANTARA</button>
+    </div>
+  </div>
+  <div class="tb-center">
+    <div class="clk-label">SIM TIME</div>
+    <div id="clock">07:00:00</div>
+    <div class="time-controls">
+      <button class="tbtn" id="btn-pause" title="SPACE">⏸</button>
+      <button class="tbtn spd active" data-spd="1">1×</button>
+      <button class="tbtn spd" data-spd="90">90×</button>
+      <button class="tbtn spd" data-spd="300">300×</button>
+      <button class="tbtn spd" data-spd="900">900×</button>
+    </div>
+  </div>
+  <div class="tb-right">
+    <div class="stat"><span class="stat-label">VEHICLES</span><span class="stat-value" id="stat-veh">0</span></div>
+    <div class="stat"><span class="stat-label" id="stat-spd-label">AVG MPH</span><span class="stat-value" id="stat-spd">0</span></div>
+    <div class="stat"><span class="stat-label" id="stat-net-label">NET MI</span><span class="stat-value" id="stat-mi">—</span></div>
+    <div class="stat"><span class="stat-label">ROUTES</span><span class="stat-value" id="stat-rt">—</span></div>
+  </div>
+</header>
+
+<!-- ═══ LEFT: ROUTE INDEX ═══ -->
+<aside id="route-panel" class="panel hud-hidden">
+  <div class="panel-head" data-collapse="route-body">
+    <span class="ph-tick">▸</span> ROUTE INDEX <span class="ph-dim" id="route-count"></span>
+  </div>
+  <div id="route-body">
+    <input id="route-search" type="text" placeholder="SCAN ROUTES / CITIES…" autocomplete="off" spellcheck="false">
+    <div id="city-hits"></div>
+    <div id="route-list"></div>
+  </div>
+</aside>
+
+<!-- ═══ RIGHT: TELEMETRY ═══ -->
+<aside id="telemetry" class="panel hud-hidden">
+  <div class="panel-head" data-collapse="tele-body">
+    <span class="ph-tick">▸</span> TELEMETRY
+  </div>
+  <div id="tele-body">
+    <div class="tele-label">DIURNAL LOAD PROFILE</div>
+    <canvas id="spark" width="246" height="64"></canvas>
+    <div class="tele-label">TRAFFIC DENSITY</div>
+    <div class="seg" id="density-seg">
+      <button data-d="0.35">CALM</button>
+      <button data-d="0.7" class="active">NORMAL</button>
+      <button data-d="1.3">HEAVY</button>
+      <button data-d="2.0">GRIDLCK</button>
+    </div>
+    <div class="tele-label">DISPLAY LAYERS</div>
+        <div class="seg wrap" id="layer-seg">
+      <button data-layer="traffic" class="active">FLOW</button>
+      <button data-layer="labels" class="active">LABELS</button>
+      <button data-layer="cities" class="active">CITIES</button>
+      <button data-layer="grid">GRATICULE</button>
+      <button data-layer="states" class="active">STATES</button>
+      <button data-layer="art" class="active">ARTERIES</button>
+      <button data-layer="cty" class="active">COUNTY</button>
+      <button data-layer="hydro" class="active">HYDRO</button>
+      <button data-layer="fx" class="active">FX</button>
+    </div>
+    <div class="tele-label">LIVE TRAFFIC UPLINK</div>
+    <div id="live-box">
+      <div class="live-row"><span class="live-k">SOURCE</span><span class="live-v" id="live-src">—</span></div>
+      <div class="live-row"><span class="live-k">STATUS</span><span class="live-v" id="live-status">SYNCING…</span></div>
+      <div class="live-row"><span class="live-k">LINKS / MAPPED</span><span class="live-v" id="live-map">—</span></div>
+      <div class="live-row"><span class="live-k">DATA AGE</span><span class="live-v" id="live-age">—</span></div>
+      <div id="live-slow"></div>
+    </div>
+    <button id="live-toggle" class="live-onbtn active">LIVE LAYER · ON</button>
+    <div class="tele-label">CAMERA</div>
+    <div class="seg" id="cam-seg">
+      <button id="zoom-in">ZOOM +</button>
+      <button id="zoom-out">ZOOM −</button>
+      <button id="zoom-reset">RESET</button>
+    </div>
+    <div id="tele-log" class="tele-log"></div>
+  </div>
+</aside>
+
+<!-- ═══ BOTTOM LEFT: ROUTE CARD ═══ -->
+<section id="route-card" class="panel hud-hidden hidden">
+  <div class="rc-head"><span class="rc-blink">●</span> TARGET LOCK</div>
+  <div class="rc-body">
+    <div id="rc-shield"></div>
+    <div class="rc-info">
+      <div id="rc-name">I-80</div>
+      <div id="rc-class" class="rc-class">PRIMARY · TRANSCONTINENTAL</div>
+      <div class="rc-grid">
+        <div><span class="rc-k">LENGTH</span><span class="rc-v" id="rc-mi">—</span></div>
+        <div><span class="rc-k">AXIS</span><span class="rc-v" id="rc-axis">—</span></div>
+        <div><span class="rc-k">UNITS ON ROUTE</span><span class="rc-v" id="rc-veh">—</span></div>
+        <div><span class="rc-k" id="rc-spd-label">ROUTE AVG MPH</span><span class="rc-v" id="rc-spd">—</span></div>
+      </div>
+      <div id="rc-status" class="rc-status">FLOW: FREE</div>
+    </div>
+  </div>
+  <div class="rc-termini">
+    <div class="rc-term" id="rc-t1"></div>
+    <div class="rc-term-arrow">◀══════════════▶</div>
+    <div class="rc-term" id="rc-t2"></div>
+  </div>
+</section>
+
+<!-- ═══ BOTTOM CENTER: CURSOR READOUT + TICKER ═══ -->
+<div id="bottombar" class="hud-hidden">
+  <div id="ticker">SYSTEM NOMINAL — TRACKING ALL SECTORS</div>
+  <div id="cursor-read">CURSOR — — — · ZOOM 1.0</div>
+</div>
+
+<!-- ═══ HOVER CHIP ═══ -->
+<div id="hover-chip" class="hidden"></div>
+
+<!-- ═══ HELP ═══ -->
+<div id="help" class="hud-hidden">DRAG pan · WHEEL zoom · CLICK route to lock · ESC release · SPACE pause · TAB theater · / routes+cities · ENTER fly-to</div>
+
+<script src="js/data-routes.js"></script>
+<script src="js/data-states.js"></script>
+<script src="js/data-id.js"></script>
+<script src="js/data-id-extra.js"></script>
+<script src="js/data-cities.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
