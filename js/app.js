@@ -714,7 +714,7 @@ function drawLabels() {
     fctx.fillStyle = 'rgba(1,10,16,0.85)';
     fctx.strokeStyle = r.aux ? 'rgba(255,158,44,0.75)' : NETW.labelCol;
     fctx.lineWidth = 1;
-    roundRect(ctx, p[0] - wTxt / 2, p[1] - 8, wTxt, 16, 3); fctx.fill(); fctx.stroke();
+    roundRect(fctx, p[0] - wTxt / 2, p[1] - 8, wTxt, 16, 3); fctx.fill(); fctx.stroke();
     fctx.fillStyle = r.aux ? '#ffb03a' : NETW.labelTxt;
     fctx.fillText(num, p[0], p[1] + 0.5);
   }
