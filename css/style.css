@@ -30,12 +30,13 @@ html, body {
 }
 
 /* ─── canvases ─── */
-#map, #veh {
+#map, #veh, #fxc {
   position: absolute; inset: 0;
   width: 100%; height: 100%;
   display: block;
 }
 #veh { pointer-events: none; }
+#fxc { pointer-events: none; z-index: 2; }
 
 /* ─── FX overlays ─── */
 #fx-scan {
@@ -43,7 +44,10 @@ html, body {
   background: repeating-linear-gradient(0deg,
     rgba(0, 0, 0, .20) 0px, rgba(0, 0, 0, .20) 1px,
     transparent 1px, transparent 3px);
-  mix-blend-mode: multiply;
+  /* NOT mix-blend-mode:multiply — for black stripes the multiply result is the
+     same as plain source-over darkening, but multiply forces a full-viewport
+     unfused blend every frame (kills fps). Normal blend = GPU-composited once. */
+  will-change: opacity;
   animation: scanflicker 6s steps(2) infinite;
 }
 @keyframes scanflicker { 0%,100% {opacity:.9} 48% {opacity:.75} 52% {opacity:.95} }

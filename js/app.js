@@ -201,9 +201,10 @@ const hav = (lo1, la1, lo2, la2) => {
 };
 
 /* ── 3 · camera & layers ────────────────────────────────────── */
-const mapCv = $('map'), vehCv = $('veh');
+const mapCv = $('map'), vehCv = $('veh'), fxCv = $('fxc');
 const ctx = mapCv.getContext('2d');
 const vctx = vehCv.getContext('2d');
+const fctx = fxCv.getContext('2d');
 const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
 let VW = 0, VH = 0;
 const cam = { cx: 0, cy: 0, z: 1, zFit: 1 };
@@ -217,11 +218,12 @@ const L = { traffic: true, labels: true, cities: true, grid: false, states: true
 
 function resize() {
   VW = window.innerWidth; VH = window.innerHeight;
-  for (const c of [mapCv, vehCv, base]) {
+  for (const c of [mapCv, vehCv, fxCv, base]) {
     c.width = VW * DPR; c.height = VH * DPR;
   }
   mapCv.getContext('2d').setTransform(DPR, 0, 0, DPR, 0, 0);
   vehCv.getContext('2d').setTransform(DPR, 0, 0, DPR, 0, 0);
+  fctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   bctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   cam.zFit = Math.min(VW / (WXMAX - WXMIN), VH / (WYMAX - WYMIN)) * 0.86;
   cameraChanged(); retraceBaseNow();
@@ -253,6 +255,7 @@ function retraceBaseNow() {
   prevCam.cx = cam.cx; prevCam.cy = cam.cy; prevCam.z = cam.z;
   if (gridDirty) { gridDirty = false; buildPickGrid(); }
   drawBase();
+  blitBase();   // push the fresh base to the persistent map canvas
 }
 function updateSelBbox() {
   let X0 = 9e9, Y0 = 9e9, X1 = -9e9, Y1 = -9e9;
@@ -545,6 +548,26 @@ function stepSim(dtReal) {
 
 /* ── 7 · render loop ────────────────────────────────────────── */
 const BEAR_COL = ['#49c8ff', '#38ffb2', '#ffb03a', '#c77dff'];
+/* scissored trail fade: per-cell trail-energy stamps (24 px cells, 256-stride grid) */
+const FCELL = 24;
+const cellT = new Uint16Array(256 * 256);
+let fStamp = 1;
+function fadeTrails() {
+  vctx.globalCompositeOperation = 'destination-out';
+  vctx.fillStyle = 'rgba(0,0,0,0.30)';
+  const gw = (VW / FCELL | 0) + 1, gh = (VH / FCELL | 0) + 1;
+  for (let cy = 0; cy < gh; cy++) {
+    const row = cy * 256;
+    for (let cx = 0; cx < gw; cx++)
+      if (((fStamp - cellT[row + cx]) & 0xFFFF) < 22)
+        vctx.fillRect(cx * FCELL, cy * FCELL, FCELL, FCELL);
+  }
+  vctx.globalCompositeOperation = 'lighter';
+}
+/* per-frame dot batches: 4 fillStyle switches instead of up to 5,600 */
+const bkX = [new Float32Array(6000), new Float32Array(6000), new Float32Array(6000), new Float32Array(6000)];
+const bkY = [new Float32Array(6000), new Float32Array(6000), new Float32Array(6000), new Float32Array(6000)];
+const bkS = [new Float32Array(6000), new Float32Array(6000), new Float32Array(6000), new Float32Array(6000)];
 const pings = [];
 let lastT = performance.now(), hudT = 0, tickerT = 0, pingT = 0, frameN = 0;
 let avgSpeed = 0;
@@ -560,9 +583,10 @@ function frame(now) {
     retraceBaseNow();
   stepSim(dt);
 
-  ctx.clearRect(0, 0, VW, VH);
-  blitBase();
+  // map canvas is PERSISTENT — untouched unless the camera moved this frame
+  if (baseStale) blitBase();
 
+  fctx.clearRect(0, 0, VW, VH);
   const hotR = hoverEdge >= 0 ? eR[hoverEdge] : -1;
   if (hotR >= 0 && hotR !== selRoute) drawRouteGlow(hotR, 'rgba(24,224,255,0.55)', 2.2);
   if (selRoute >= 0) {
@@ -572,17 +596,11 @@ function frame(now) {
   }
 
   if (L.traffic && vN > 0) {
-    // trail fade is the single most expensive per-frame op — run it every other
-    // frame with compensated alpha (0.30/frame ≈ 0.51/2 frames): visually identical
-    if ((frameN = (frameN + 1) & 1) === 0) {
-      vctx.globalCompositeOperation = 'destination-out';
-      vctx.fillStyle = 'rgba(0,0,0,0.51)';
-      vctx.fillRect(0, 0, VW, VH);
-    }
-    vctx.globalCompositeOperation = 'lighter';
+    fadeTrails();
     routeVehCount.fill(0); routeSpdSum.fill(0);
     let spd = 0;
     const c = congestion(densEff());
+    const bkN = [0, 0, 0, 0];
     for (let idx = 0; idx < vN; idx++) {
       const e = vEdge[idx], t = vT[idx];
       const a = eA[e], b = eB[e];
@@ -591,13 +609,25 @@ function frame(now) {
       const r = eR[e], v = lv > 0 ? lv * 0.97 : vBase[idx] * c;
       routeVehCount[r]++; routeSpdSum[r] += v; spd += v;
       if (x < -4 || x > VW + 4 || y < -4 || y > VH + 4) continue;   // skip pixels only
-      const truck = vTruck[idx], s = truck ? 3.2 : 2.2;
-      vctx.globalAlpha = truck ? 0.85 : 0.95;
-      vctx.fillStyle = BEAR_COL[vBear[idx]];
-      vctx.fillRect(x - s / 2, y - s / 2, s, s);
+      const bi = vBear[idx], n = bkN[bi];
+      bkX[bi][n] = x; bkY[bi][n] = y; bkS[bi][n] = vTruck[idx] ? 3.2 : 2.2; bkN[bi]++;
+      cellT[((x / FCELL) | 0) + ((y / FCELL) | 0) * 256] = fStamp;
+    }
+    for (let bi = 0; bi < 4; bi++) {
+      const n = bkN[bi];
+      if (!n) continue;
+      vctx.fillStyle = BEAR_COL[bi];
+      const xs = bkX[bi], ys = bkY[bi], ss = bkS[bi];
+      let lastAl = -1;
+      for (let j = 0; j < n; j++) {
+        const s = ss[j], al = s > 3 ? 0.85 : 0.95;
+        if (al !== lastAl) { vctx.globalAlpha = al; lastAl = al; }
+        vctx.fillRect(xs[j] - s / 2, ys[j] - s / 2, s, s);
+      }
     }
     vctx.globalAlpha = 1;
     avgSpeed = vN ? spd / vN : 0;
+    fStamp = (fStamp + 1) & 0xFFFF;
   }
 
   if (L.fx) {
@@ -609,9 +639,9 @@ function frame(now) {
       if (al <= 0) { pings.splice(i, 1); continue; }
       const x = sx[p.n], y = sy[p.n];
       if (x < -60 || x > VW + 60 || y < -60 || y > VH + 60) continue;
-      ctx.strokeStyle = `rgba(56,255,178,${al * 0.5})`;
-      ctx.lineWidth = 1.2;
-      ctx.beginPath(); ctx.arc(x, y, p.r, 0, 6.2832); ctx.stroke();
+      fctx.strokeStyle = `rgba(56,255,178,${al * 0.5})`;
+      fctx.lineWidth = 1.2;
+      fctx.beginPath(); fctx.arc(x, y, p.r, 0, 6.2832); fctx.stroke();
     }
   }
 
@@ -628,35 +658,35 @@ function frame(now) {
 }
 
 function drawRouteGlow(ri, color, width) {
-  ctx.strokeStyle = color;
+  fctx.strokeStyle = color;
   const edgesList = routeEdges[ri];
-  ctx.lineCap = 'round';
-  ctx.globalAlpha = 0.3; ctx.lineWidth = width * 3;
-  ctx.beginPath();
-  for (const e of edgesList) { ctx.moveTo(sx[eA[e]], sy[eA[e]]); ctx.lineTo(sx[eB[e]], sy[eB[e]]); }
-  ctx.stroke();
-  ctx.globalAlpha = 1; ctx.lineWidth = width;
-  ctx.beginPath();
-  for (const e of edgesList) { ctx.moveTo(sx[eA[e]], sy[eA[e]]); ctx.lineTo(sx[eB[e]], sy[eB[e]]); }
-  ctx.stroke();
+  fctx.lineCap = 'round';
+  fctx.globalAlpha = 0.3; fctx.lineWidth = width * 3;
+  fctx.beginPath();
+  for (const e of edgesList) { fctx.moveTo(sx[eA[e]], sy[eA[e]]); fctx.lineTo(sx[eB[e]], sy[eB[e]]); }
+  fctx.stroke();
+  fctx.globalAlpha = 1; fctx.lineWidth = width;
+  fctx.beginPath();
+  for (const e of edgesList) { fctx.moveTo(sx[eA[e]], sy[eA[e]]); fctx.lineTo(sx[eB[e]], sy[eB[e]]); }
+  fctx.stroke();
 }
 let selBbox = null;
 function drawSelectionBrackets(now) {
   if (!selBbox) return;
   const [x0, y0, x1, y1] = selBbox, s = 13;
   const o = 2 * Math.sin(now * 0.004);
-  ctx.strokeStyle = 'rgba(255,176,58,0.9)'; ctx.lineWidth = 1.6;
-  ctx.beginPath();
-  ctx.moveTo(x0 - o, y0 + s); ctx.lineTo(x0 - o, y0 - o); ctx.lineTo(x0 + s, y0 - o);
-  ctx.moveTo(x1 - s, y0 - o); ctx.lineTo(x1 + o, y0 - o); ctx.lineTo(x1 + o, y0 + s);
-  ctx.moveTo(x1 + o, y1 - s); ctx.lineTo(x1 + o, y1 + o); ctx.lineTo(x1 - s, y1 + o);
-  ctx.moveTo(x0 + s, y1 + o); ctx.lineTo(x0 - o, y1 + o); ctx.lineTo(x0 - o, y1 - s);
-  ctx.stroke();
+  fctx.strokeStyle = 'rgba(255,176,58,0.9)'; fctx.lineWidth = 1.6;
+  fctx.beginPath();
+  fctx.moveTo(x0 - o, y0 + s); fctx.lineTo(x0 - o, y0 - o); fctx.lineTo(x0 + s, y0 - o);
+  fctx.moveTo(x1 - s, y0 - o); fctx.lineTo(x1 + o, y0 - o); fctx.lineTo(x1 + o, y0 + s);
+  fctx.moveTo(x1 + o, y1 - s); fctx.lineTo(x1 + o, y1 + o); fctx.lineTo(x1 - s, y1 + o);
+  fctx.moveTo(x0 + s, y1 + o); fctx.lineTo(x0 - o, y1 + o); fctx.lineTo(x0 - o, y1 - s);
+  fctx.stroke();
 }
 
 function drawLabels() {
   const zoomF = cam.z / cam.zFit;
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  fctx.textAlign = 'center'; fctx.textBaseline = 'middle';
   const placed = [];
   for (let i = 0; i < NR; i++) {
     const r = ROUTES[i];
@@ -671,22 +701,22 @@ function drawLabels() {
     const num = labelNum[i];
     let wTxt = labelW[i];
     if (wTxt < 0) {
-      ctx.font = '700 9.5px Orbitron, sans-serif';
-      wTxt = labelW[i] = ctx.measureText(num).width + 10;
+      fctx.font = '700 9.5px Orbitron, sans-serif';
+      wTxt = labelW[i] = fctx.measureText(num).width + 10;
     }
-    ctx.font = (r.aux ? '600 8.5px' : '700 9.5px') + ' Orbitron, sans-serif';
+    fctx.font = (r.aux ? '600 8.5px' : '700 9.5px') + ' Orbitron, sans-serif';
     if (r.aux) wTxt *= 0.92;
     let clash = false;
     for (const q of placed)
       if (Math.abs(q[0] - p[0]) < (q[2] + wTxt) / 2 + 4 && Math.abs(q[1] - p[1]) < 18) { clash = true; break; }
     if (clash) continue;
     placed.push([p[0], p[1], wTxt]);
-    ctx.fillStyle = 'rgba(1,10,16,0.85)';
-    ctx.strokeStyle = r.aux ? 'rgba(255,158,44,0.75)' : NETW.labelCol;
-    ctx.lineWidth = 1;
-    roundRect(ctx, p[0] - wTxt / 2, p[1] - 8, wTxt, 16, 3); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = r.aux ? '#ffb03a' : NETW.labelTxt;
-    ctx.fillText(num, p[0], p[1] + 0.5);
+    fctx.fillStyle = 'rgba(1,10,16,0.85)';
+    fctx.strokeStyle = r.aux ? 'rgba(255,158,44,0.75)' : NETW.labelCol;
+    fctx.lineWidth = 1;
+    roundRect(ctx, p[0] - wTxt / 2, p[1] - 8, wTxt, 16, 3); fctx.fill(); fctx.stroke();
+    fctx.fillStyle = r.aux ? '#ffb03a' : NETW.labelTxt;
+    fctx.fillText(num, p[0], p[1] + 0.5);
   }
 }
 function roundRect(c, x, y, w, h, r) {
@@ -703,7 +733,7 @@ function cityGate(t) {
 }
 function drawCities() {
   const zoomF = cam.z / cam.zFit;
-  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  fctx.textAlign = 'left'; fctx.textBaseline = 'middle';
   const placed = [];
   let shown = 0;
   for (const c of CITIES_W) {
@@ -714,8 +744,8 @@ function drawCities() {
     if (p[0] < -60 || p[0] > VW + 60 || p[1] < -40 || p[1] > VH + 40) continue;
     const deep = tier >= 5.5;
     const nm = name;
-    ctx.font = (tier < 1.5 ? '700 10px' : tier < 2.5 ? '600 9px' : deep ? '600 8px' : '600 8.5px') + ' "Share Tech Mono", monospace';
-    if (c[4] < 0) c[4] = ctx.measureText(nm).width;   // constant per city — measure once
+    fctx.font = (tier < 1.5 ? '700 10px' : tier < 2.5 ? '600 9px' : deep ? '600 8px' : '600 8.5px') + ' "Share Tech Mono", monospace';
+    if (c[4] < 0) c[4] = fctx.measureText(nm).width;   // constant per city — measure once
     const w = c[4];
     const bx = p[0] + 6, by = p[1] - 7, bw = w + 7, bh = 12;
     let clash = shown > 260;
@@ -727,15 +757,15 @@ function drawCities() {
     const fade = gate === 0 ? 1 : clamp((zoomF - gate) / 0.5, 0.15, 1);
     const s = (zoomF > 2.4 ? 3.2 : 2.4) *
       (deep ? 0.6 : tier >= 4.5 ? 0.7 : tier >= 3.5 ? 0.8 : tier >= 2.5 ? 0.9 : tier >= 1.9 ? 1 : 1.2);
-    ctx.strokeStyle = deep ? `rgba(150,205,220,${0.42 * fade})`
+    fctx.strokeStyle = deep ? `rgba(150,205,220,${0.42 * fade})`
       : `rgba(160,240,255,${(tier < 1.5 ? 0.95 : tier < 2.5 ? 0.85 : 0.6) * fade})`;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(p[0], p[1] - s); ctx.lineTo(p[0] + s, p[1]); ctx.lineTo(p[0], p[1] + s); ctx.lineTo(p[0] - s, p[1]);
-    ctx.closePath(); ctx.stroke();
-    ctx.fillStyle = deep ? `rgba(150,205,220,${0.5 * fade})`
+    fctx.lineWidth = 1;
+    fctx.beginPath();
+    fctx.moveTo(p[0], p[1] - s); fctx.lineTo(p[0] + s, p[1]); fctx.lineTo(p[0], p[1] + s); fctx.lineTo(p[0] - s, p[1]);
+    fctx.closePath(); fctx.stroke();
+    fctx.fillStyle = deep ? `rgba(150,205,220,${0.5 * fade})`
       : `rgba(160,240,255,${(tier < 2.5 ? 0.9 : 0.7) * fade})`;
-    ctx.fillText(nm, p[0] + 7, p[1] - 1);
+    fctx.fillText(nm, p[0] + 7, p[1] - 1);
   }
 }
 

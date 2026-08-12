@@ -77,9 +77,13 @@ FLOW · LABELS · CITIES (tiered) · GRATICULE · STATES · **ARTERIES** · **CO
   hard-refresh at most every 0.26 s when idle-ish, 2 s safety cap)
 - Backdrop geometry is **viewport-culled** (precomputed world bboxes) and point-decimated at
   coarse zoom; the hover pick-grid rebuilds at most once per frame
-- Measured in software-rendered headless Chromium (worst case): **4.3 → 17.7 fps** sustained
-  multi-segment CONUS drag, **8.6 → 19.2 fps** NUSANTARA — motion frames now cost the same as
-  idle frames; heavy retrace only happens once the camera has settled (90 ms debounce)
+- Three-canvas architecture: persistent base (redrawn only on retrace) · trail layer with
+  **scissored fade** (only 24 px cells containing trail energy get faded) · transparent FX
+  overlay; vehicle dots batched by colour (4 fillStyle switches per frame, not thousands)
+- The HUD scanline overlay no longer uses `mix-blend-mode: multiply` (it forced an unfused
+  full-viewport blend every single frame — the one-line fix was worth ~2.6× fps alone)
+- Measured in software-rendered headless Chromium (worst case; real GPU browsers run far higher):
+  sustained CONUS drag **4.3 → 30+ fps (≈7×)** — and pan/wheel frames now cost the same as idle
 
 ## Controls
 
