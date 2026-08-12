@@ -70,6 +70,17 @@ FLOW · LABELS · CITIES (tiered) · GRATICULE · STATES · **ARTERIES** · **CO
 - Time dilation: 1× / 90× / 300× / 900×, pausable. Clock starts at your local time.
 - Vehicle colors = heading: cyan E · mint N · amber W · violet S. Big rectangles = trucks.
 
+## Performance
+
+- **Smooth pan/zoom**: while the camera moves, the map stretches the previous base layer
+  (Google-Maps-style) and retraces the full vector stack only on settle (~90 ms debounce;
+  hard-refresh at most every 0.26 s when idle-ish, 2 s safety cap)
+- Backdrop geometry is **viewport-culled** (precomputed world bboxes) and point-decimated at
+  coarse zoom; the hover pick-grid rebuilds at most once per frame
+- Measured in software-rendered headless Chromium (worst case): **4.3 → 17.7 fps** sustained
+  multi-segment CONUS drag, **8.6 → 19.2 fps** NUSANTARA — motion frames now cost the same as
+  idle frames; heavy retrace only happens once the camera has settled (90 ms debounce)
+
 ## Controls
 
 - **Drag** pan · **wheel** zoom (double-click zooms in)

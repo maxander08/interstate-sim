@@ -204,13 +204,13 @@ const hav = (lo1, la1, lo2, la2) => {
 const mapCv = $('map'), vehCv = $('veh');
 const ctx = mapCv.getContext('2d');
 const vctx = vehCv.getContext('2d');
-const DPR = Math.min(window.devicePixelRatio || 1, 1.75);
+const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
 let VW = 0, VH = 0;
 const cam = { cx: 0, cy: 0, z: 1, zFit: 1 };
 const base = document.createElement('canvas'), bctx = base.getContext('2d');
 // while the camera moves we don't retrace the whole vector stack per frame —
 // frame() stretches the previous base (Google-Maps-style) and we retrace on settle
-let baseStale = false, camMovedAt = 0, lastRetrace = 0, rtrT = 0, wheelT = 0, gridDirty = false;
+let baseStale = false, camMovedAt = 0, lastRetrace = 0, rtrT = 0, wheelT = 0, gridDirty = false, vehDirty = false;
 const prevCam = { cx: 0, cy: 0, z: 1 };
 
 const L = { traffic: true, labels: true, cities: true, grid: false, states: true, fx: true, art: true, cty: true, hydro: true };
@@ -235,7 +235,7 @@ function cameraChanged() {
   if (!baseStale) camMovedAt = performance.now();
   baseStale = true;
   clearTimeout(rtrT); rtrT = setTimeout(retraceBaseNow, 90);
-  gridDirty = true; clearVeh();
+  gridDirty = true; vehDirty = true;
   if (selRoute >= 0) updateSelBbox();
 }
 /* stretch of the stale base under the current camera (pure bitblit, ~free) */
@@ -251,6 +251,7 @@ function retraceBaseNow() {
   clearTimeout(rtrT);
   baseStale = false; lastRetrace = performance.now();
   prevCam.cx = cam.cx; prevCam.cy = cam.cy; prevCam.z = cam.z;
+  if (gridDirty) { gridDirty = false; buildPickGrid(); }
   drawBase();
 }
 function updateSelBbox() {
@@ -551,10 +552,12 @@ let routeVehCount = new Int32Array(0), routeSpdSum = new Float32Array(0);
 
 function frame(now) {
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
-  if (baseStale && now - lastRetrace > 130 &&
-      ((now - camMovedAt > 220 && !dragging && !tween && now - wheelT > 200) || now - camMovedAt > 2000))
+  if (vehDirty) { vehDirty = false; clearVeh(); }
+  // retrace policy: never mid-drag (blit is pixel-exact while panning), never mid-wheel-storm;
+  // during fly-to tweens at a slower cadence; on settle the 90 ms debounce handles it.
+  if (baseStale && !dragging && now - wheelT > 120 && now - camMovedAt > 200 &&
+      now - lastRetrace > (tween ? 420 : 130))
     retraceBaseNow();
-  if (gridDirty) { gridDirty = false; buildPickGrid(); }
   stepSim(dt);
 
   ctx.clearRect(0, 0, VW, VH);
