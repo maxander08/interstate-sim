@@ -73,8 +73,11 @@ FLOW · LABELS · CITIES (tiered) · GRATICULE · STATES · **ARTERIES** · **CO
 ## Performance
 
 - **Smooth pan/zoom**: while the camera moves, the map stretches the previous base layer
-  (Google-Maps-style) and retraces the full vector stack only on settle (~90 ms debounce;
-  hard-refresh at most every 0.26 s when idle-ish, 2 s safety cap)
+  (Google-Maps-style) — rendered into an **overscan buffer** (~48% margin per side) so pans
+  stay pixel-exact without any retrace at all; when the margin runs low mid-drag the map
+  **retraces in flight**, led ~0.24 s ahead of the drag velocity, throttled by measured
+  retrace cost (only fires on machines where a retrace is cheap). On release there is
+  usually nothing left to load — no settle snap
 - Backdrop geometry is **viewport-culled** (precomputed world bboxes) and point-decimated at
   coarse zoom; the hover pick-grid rebuilds at most once per frame
 - Three-canvas architecture: persistent base (redrawn only on retrace) · trail layer with

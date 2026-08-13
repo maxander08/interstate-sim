@@ -208,6 +208,8 @@ const fctx = fxCv.getContext('2d');
 const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
 let VW = 0, VH = 0;
 const cam = { cx: 0, cy: 0, z: 1, zFit: 1 };
+const OSM = DPR > 1.25 ? 0.36 : 0.48;   // overscan margin per side (fraction of viewport) — map pre-renders beyond the frame so pans stay crisp
+let Bw = 0, Bh = 0, OSMW = 0, OSMH = 0;             // base buffer CSS-px size + margins
 const base = document.createElement('canvas'), bctx = base.getContext('2d');
 // while the camera moves we don't retrace the whole vector stack per frame —
 // frame() stretches the previous base (Google-Maps-style) and we retrace on settle
@@ -218,9 +220,12 @@ const L = { traffic: true, labels: true, cities: true, grid: false, states: true
 
 function resize() {
   VW = window.innerWidth; VH = window.innerHeight;
-  for (const c of [mapCv, vehCv, fxCv, base]) {
+  for (const c of [mapCv, vehCv, fxCv]) {
     c.width = VW * DPR; c.height = VH * DPR;
   }
+  OSMW = Math.round(VW * OSM); OSMH = Math.round(VH * OSM);
+  Bw = VW + 2 * OSMW; Bh = VH + 2 * OSMH;
+  base.width = Bw * DPR; base.height = Bh * DPR;
   mapCv.getContext('2d').setTransform(DPR, 0, 0, DPR, 0, 0);
   vehCv.getContext('2d').setTransform(DPR, 0, 0, DPR, 0, 0);
   fctx.setTransform(DPR, 0, 0, DPR, 0, 0);
@@ -229,6 +234,21 @@ function resize() {
   cameraChanged(); retraceBaseNow();
 }
 function worldToScreen(u, v) { return [(u - cam.cx) * cam.z + VW / 2, VH / 2 - (v - cam.cy) * cam.z]; }
+const dragHist = [];
+function predCam() {
+  // lead the trace center by ~0.24s of current drag velocity, capped inside the margin
+  if (dragHist.length < 2) return null;
+  const b = dragHist[dragHist.length - 1], a = dragHist[Math.max(0, dragHist.length - 4)];
+  const dt = (b[0] - a[0]) / 1000; if (dt < 0.02) return null;
+  let vx = (b[1] - a[1]) / dt, vy = (b[2] - a[2]) / dt;
+  if (performance.now() - b[0] > 130) { vx = 0; vy = 0; }
+  const mx = OSMW * 0.85 / cam.z, my = OSMH * 0.85 / cam.z;
+  return { cx: cam.cx + clamp(vx * 0.24, -mx, mx), cy: cam.cy + clamp(vy * 0.24, -my, my), z: cam.z };
+}
+function baseSlackMin() {  // px of buffer margin remaining beyond the viewport at current pan
+  return Math.min(OSMW - Math.abs(prevCam.cx - cam.cx) * cam.z,
+                  OSMH - Math.abs(prevCam.cy - cam.cy) * cam.z);
+}
 function cameraChanged() {
   for (let i = 0; i < NN; i++) {
     sx[i] = (wx[i] - cam.cx) * cam.z + VW / 2;
@@ -242,19 +262,27 @@ function cameraChanged() {
 }
 /* stretch of the stale base under the current camera (pure bitblit, ~free) */
 function blitBase() {
-  if (!baseStale || !lastRetrace) { ctx.drawImage(base, 0, 0, VW, VH); return; }
+  if (!lastRetrace) { ctx.drawImage(base, OSMW * DPR, OSMH * DPR, VW * DPR, VH * DPR, 0, 0, VW, VH); return; }
   const k = cam.z / prevCam.z;
-  const dx = VW / 2 * (1 - k) + (prevCam.cx - cam.cx) * cam.z;
-  const dy = VH / 2 * (1 - k) - (prevCam.cy - cam.cy) * cam.z;
+  let dx = VW / 2 - Bw / 2 * k + (prevCam.cx - cam.cx) * cam.z;
+  let dy = VH / 2 - Bh / 2 * k - (prevCam.cy - cam.cy) * cam.z;
+  if (k === 1) { dx = Math.round(dx); dy = Math.round(dy); }   // pixel-perfect pure-pan blit
   ctx.fillStyle = '#010308'; ctx.fillRect(0, 0, VW, VH);
-  ctx.drawImage(base, dx, dy, VW * k, VH * k);
+  ctx.drawImage(base, 0, 0, base.width, base.height, dx, dy, Bw * k, Bh * k);
 }
-function retraceBaseNow() {
+let retraceEMA = 20;   // measured retrace cost (ms) — gates in-flight retraces on slow machines
+function retraceBaseNow(overCam) {
   clearTimeout(rtrT);
-  baseStale = false; lastRetrace = performance.now();
-  prevCam.cx = cam.cx; prevCam.cy = cam.cy; prevCam.z = cam.z;
+  const t0 = performance.now();
+  window.__rtrN = (window.__rtrN || 0) + 1;
+  if (dragging) window.__rtrDragN = (window.__rtrDragN || 0) + 1;
+  baseStale = false;
+  const C = overCam || cam;
+  prevCam.cx = C.cx; prevCam.cy = C.cy; prevCam.z = C.z;
   if (gridDirty) { gridDirty = false; buildPickGrid(); }
-  drawBase();
+  drawBase(C);
+  lastRetrace = performance.now();
+  retraceEMA = retraceEMA * 0.7 + (lastRetrace - t0) * 0.3;
   blitBase();   // push the fresh base to the persistent map canvas
 }
 function updateSelBbox() {
@@ -274,30 +302,32 @@ function fitView() {
 function clearVeh() { vctx.save(); vctx.globalCompositeOperation = 'source-over'; vctx.clearRect(0, 0, VW, VH); vctx.restore(); }
 
 /* ── 4 · base layer render ──────────────────────────────────── */
-function drawBase() {
-  bctx.clearRect(0, 0, VW, VH);
-  const g = bctx.createRadialGradient(VW / 2, VH * 0.42, 40, VW / 2, VH * 0.5, Math.max(VW, VH) * 0.75);
+function drawBase(C2) {
+  const C = C2 || cam, Cz = C.z;
+  const w2s = (u, v) => [(u - C.cx) * Cz + Bw / 2, Bh / 2 - (v - C.cy) * Cz];
+  bctx.clearRect(0, 0, Bw, Bh);
+  const g = bctx.createRadialGradient(Bw / 2, Bh * 0.42, 40, Bw / 2, Bh * 0.5, Math.max(Bw, Bh) * 0.75);
   g.addColorStop(0, '#030b14'); g.addColorStop(1, '#010308');
-  bctx.fillStyle = g; bctx.fillRect(0, 0, VW, VH);
+  bctx.fillStyle = g; bctx.fillRect(0, 0, Bw, Bh);
 
   bctx.lineJoin = 'round'; bctx.lineCap = 'round';
 
   /* view-rect culling (skip polylines fully offscreen) + coarse-zoom decimation */
-  const zm = 80 / cam.z;
-  const vu0 = cam.cx - VW / 2 / cam.z - zm, vu1 = cam.cx + VW / 2 / cam.z + zm;
-  const vv0 = cam.cy - VH / 2 / cam.z - zm, vv1 = cam.cy + VH / 2 / cam.z + zm;
+  const zm = 80 / Cz;
+  const vu0 = C.cx - Bw / 2 / Cz - zm, vu1 = C.cx + Bw / 2 / Cz + zm;
+  const vv0 = C.cy - Bh / 2 / Cz - zm, vv1 = C.cy + Bh / 2 / Cz + zm;
   const inView = bb => bb[0] < vu1 && bb[2] > vu0 && bb[1] < vv1 && bb[3] > vv0;
-  const pStride = cam.z / cam.zFit < 1.15 ? 3 : cam.z / cam.zFit < 2.2 ? 2 : 1;
+  const pStride = Cz / cam.zFit < 1.15 ? 3 : Cz / cam.zFit < 2.2 ? 2 : 1;
   const traceArr = (arr, close, st = 1) => {
     // never decimate sparse rings: skipping corners of an already DP-minimal
     // polygon draws chords across its interior (rectangular states!)
     if (arr.length / 2 < 40) st = 1;
     for (let i = 0; i < arr.length; i += 2 * st) {
-      const p = worldToScreen(arr[i], arr[i + 1]);
+      const p = w2s(arr[i], arr[i + 1]);
       i ? bctx.lineTo(p[0], p[1]) : bctx.moveTo(p[0], p[1]);
     }
     if (st > 1 && (arr.length - 2) % (2 * st)) {
-      const p = worldToScreen(arr[arr.length - 2], arr[arr.length - 1]);
+      const p = w2s(arr[arr.length - 2], arr[arr.length - 1]);
       bctx.lineTo(p[0], p[1]);
     }
     if (close) bctx.closePath();
@@ -307,7 +337,7 @@ function drawBase() {
     bctx.strokeStyle = 'rgba(24,224,255,0.07)'; bctx.lineWidth = 1;
     bctx.beginPath();
     for (const [p1, p2] of GRAT) {
-      const a = worldToScreen(p1[0], p1[1]), b = worldToScreen(p2[0], p2[1]);
+      const a = w2s(p1[0], p1[1]), b = w2s(p2[0], p2[1]);
       bctx.moveTo(a[0], a[1]); bctx.lineTo(b[0], b[1]);
     }
     bctx.stroke();
@@ -338,7 +368,7 @@ function drawBase() {
   }
 
   /* county mesh (US) / regency mesh (ID) */
-  if (L.cty && COUNTY_W.length && cam.z / cam.zFit > (NETW.style === 'ID' ? 0.8 : 0.42)) {
+  if (L.cty && COUNTY_W.length && Cz / cam.zFit > (NETW.style === 'ID' ? 0.8 : 0.42)) {
     bctx.strokeStyle = 'rgba(48,126,154,0.18)'; bctx.lineWidth = 0.6;
     bctx.beginPath();
     for (const [ring, bb] of COUNTY_W) { if (inView(bb)) traceArr(ring, true, pStride); }
@@ -347,7 +377,7 @@ function drawBase() {
 
   /* backdrop arterials (US hwy / state routes · nat. trunk/primary) */
   if (L.art && ART_W.length) {
-    const zf2 = cam.z / cam.zFit;
+    const zf2 = Cz / cam.zFit;
     const styles = [null, ['rgba(126,196,255,0.23)', 0.9], ['rgba(140,175,235,0.17)', 0.75], ['rgba(150,180,220,0.12)', 0.6]];
     for (let cls = 1; cls <= 3; cls++) {
       if (cls === 3 && zf2 < 1.7) continue;
@@ -358,17 +388,20 @@ function drawBase() {
     }
   }
 
-  /* network — fake glow pass + core pass */
-  const wCore = clamp(cam.z / cam.zFit, 0.55, 3.4);
-  const zoomF = cam.z / cam.zFit;
-  const mL = -60, mT = -60, mR = VW + 60, mB = VH + 60;
+  /* network — fake glow pass + core pass (screen coords at the TRACE camera) */
+  const tx = C2 ? new Float32Array(NN) : sx, ty = C2 ? new Float32Array(NN) : sy;
+  if (C2) for (let i = 0; i < NN; i++) { tx[i] = (wx[i] - C.cx) * Cz + Bw / 2; ty[i] = Bh / 2 - (wy[i] - C.cy) * Cz; }
+  else for (let i = 0; i < NN; i++) { tx[i] = sx[i] + OSMW; ty[i] = sy[i] + OSMH; }
+  const wCore = clamp(Cz / cam.zFit, 0.55, 3.4);
+  const zoomF = Cz / cam.zFit;
+  const mL = -60, mT = -60, mR = Bw + 60, mB = Bh + 60;
   for (const pass of [0, 1]) {
     for (const cls of [0, 1]) {
       bctx.beginPath();
       for (let i = 0; i < NE; i++) {
         if (eAux[i] !== cls) continue;
         if (cls === 1 && zoomF < 0.55) continue;
-        const ax = sx[eA[i]], ay = sy[eA[i]], bx = sx[eB[i]], by = sy[eB[i]];
+        const ax = tx[eA[i]], ay = ty[eA[i]], bx = tx[eB[i]], by = ty[eB[i]];
         if ((ax < mL && bx < mL) || (ax > mR && bx > mR) || (ay < mT && by < mT) || (ay > mB && by > mB)) continue;
         bctx.moveTo(ax, ay); bctx.lineTo(bx, by);
       }
@@ -385,11 +418,11 @@ function drawBase() {
 
   /* live measured-speed skin */
   if (LIVE.on && LIVE.mapped > 0) {
-    const lw = clamp(cam.z / cam.zFit, 0.8, 3);
+    const lw = clamp(Cz / cam.zFit, 0.8, 3);
     const buck = [[], [], [], []];
     for (let i = 0; i < NE; i++) {
       const mph = edgeLive[i]; if (mph <= 0) continue;
-      const ax = sx[eA[i]], ay = sy[eA[i]], bx = sx[eB[i]], by = sy[eB[i]];
+      const ax = tx[eA[i]], ay = ty[eA[i]], bx = tx[eB[i]], by = ty[eB[i]];
       if ((ax < mL && bx < mL) || (ax > mR && bx > mR) || (ay < mT && by < mT) || (ay > mB && by > mB)) continue;
       const r = mph / 62;
       buck[r < 0.2 ? 0 : r < 0.45 ? 1 : r < 0.72 ? 2 : 3].push(ax, ay, bx, by);
@@ -407,9 +440,9 @@ function drawBase() {
   if (L.grid) {
     bctx.fillStyle = 'rgba(24,224,255,0.34)'; bctx.font = '9px "Share Tech Mono", monospace';
     for (const [p1, p2, tag, vert] of GRAT) {
-      const a = worldToScreen(p1[0], p1[1]);
-      if (vert) { if (a[0] > -20 && a[0] < VW + 20) bctx.fillText(tag, clamp(a[0], 4, VW - 30), 88); }
-      else { if (a[1] > 80 && a[1] < VH + 20) bctx.fillText(tag, VW - 40, clamp(a[1], 96, VH - 8)); }
+      const a = w2s(p1[0], p1[1]);
+      if (vert) { if (a[0] > -20 && a[0] < Bw + 20) bctx.fillText(tag, clamp(a[0], 4, Bw - 30), 88); }
+      else { if (a[1] > 80 && a[1] < Bh + 20) bctx.fillText(tag, Bw - 40, clamp(a[1], 96, Bh - 8)); }
     }
   }
 }
@@ -578,9 +611,22 @@ function frame(now) {
   if (vehDirty) { vehDirty = false; clearVeh(); }
   // retrace policy: never mid-drag (blit is pixel-exact while panning), never mid-wheel-storm;
   // during fly-to tweens at a slower cadence; on settle the 90 ms debounce handles it.
-  if (baseStale && !dragging && now - wheelT > 120 && now - camMovedAt > 200 &&
-      now - lastRetrace > (tween ? 420 : 130))
-    retraceBaseNow();
+  // retrace policy: the overscan buffer makes pure pans crisp without any retrace;
+  // when the margin is about to run out mid-drag, retrace IN FLIGHT (led by drag
+  // velocity) if measured retrace cost says this machine can afford it. On settle,
+  // retrace fast if the zoom changed or the buffer is more than half-consumed —
+  // otherwise the view stays pixel-exact and no retrace is needed at all.
+  if (baseStale) {
+    if (dragging) {
+      if (baseSlackMin() < OSMW * 0.35 && retraceEMA < 34 &&
+          now - lastRetrace > Math.max(170, retraceEMA * 6))
+        retraceBaseNow(predCam());
+    } else if (tween) {
+      if (now - lastRetrace > 420) retraceBaseNow();
+    } else if (now - wheelT > 80 && now - camMovedAt > 80 && now - lastRetrace > 80 &&
+               (cam.z !== prevCam.z || baseSlackMin() < OSMW * 0.5))
+      retraceBaseNow();
+  }
   stepSim(dt);
 
   // map canvas is PERSISTENT — untouched unless the camera moved this frame
@@ -1218,7 +1264,7 @@ for (const h of document.querySelectorAll('.panel-head')) {
 /* ── 9 · pointer / keyboard ─────────────────────────────────── */
 const chip = $('hover-chip');
 let dragging = false, dragMoved = 0, lastMX = 0, lastMY = 0;
-mapCv.addEventListener('mousedown', e => { dragging = true; dragMoved = 0; lastMX = e.clientX; lastMY = e.clientY; document.body.classList.add('panning'); });
+mapCv.addEventListener('mousedown', e => { dragging = true; dragMoved = 0; lastMX = e.clientX; lastMY = e.clientY; dragHist.length = 0; document.body.classList.add('panning'); });
 window.addEventListener('mouseup', () => { dragging = false; document.body.classList.remove('panning'); });
 window.addEventListener('mousemove', e => {
   if (dragging) {
@@ -1227,6 +1273,8 @@ window.addEventListener('mousemove', e => {
     cam.cx -= dx / cam.z; cam.cy += dy / cam.z;
     lastMX = e.clientX; lastMY = e.clientY;
     cameraChanged();
+    dragHist.push([performance.now(), cam.cx, cam.cy]);
+    if (dragHist.length > 9) dragHist.shift();
   }
   hoverEdge = (e.target === mapCv && !dragging) ? pickEdge(e.clientX, e.clientY) : -1;
   if (hoverEdge >= 0) {
