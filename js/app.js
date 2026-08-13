@@ -1032,7 +1032,8 @@ async function refreshLive(first) {
   if (first) st.textContent = 'SYNCING…';
   try {
     let d = null;
-    if (!LIVE.directOnly) {
+    // static hosts (GitHub Pages etc.) have no api/ — skip the probe so the console stays clean
+    if (!LIVE.directOnly && !/\.(github\.io|netlify\.app|vercel\.app|pages\.dev|web\.app)(:|$)/.test(location.hostname)) {
       try {
         const res = await fetch('api/live-traffic', { cache: 'no-store' });
         const j = await res.json();
